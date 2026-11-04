@@ -2,6 +2,7 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import express from 'express'
 import pg from 'pg'
+import serverless from 'serverless-http'
 import { fileURLToPath } from 'node:url'
 
 dotenv.config({ path: fileURLToPath(new URL('.env', import.meta.url)) })
@@ -10,6 +11,7 @@ const { Pool } = pg
 const app = express()
 const host = process.env.HOST || '127.0.0.1'
 const port = Number(process.env.PORT) || 3000
+const isLambdaRuntime = Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT)
 const requiredDatabaseVariables = ['DB_NAME', 'DB_USER', 'DB_PASSWORD']
 const missingDatabaseVariables = requiredDatabaseVariables.filter((name) => !process.env[name])
 if (missingDatabaseVariables.length > 0) {
@@ -23,6 +25,17 @@ const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
 if (allowedOrigins.includes('*')) {
   throw new Error('CORS_ORIGIN must list specific frontend origins; wildcard origins are not allowed')
 }
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) {
+      return callback(null, true)
+    }
+    return callback(null, allowedOrigins.includes(origin))
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 200,
+}
 const maxDatabaseInteger = 2147483647
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
@@ -30,17 +43,17 @@ const pool = new Pool({
   database: process.env.DB_NAME,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 })
 
 pool.on('error', (error) => {
   console.error('Unexpected PostgreSQL pool error:', error.message)
 })
 
-app.use(cors({
-  origin(origin, callback) {
-    callback(null, typeof origin === 'string' && allowedOrigins.includes(origin))
-  },
-}))
+app.use(cors(corsOptions))
+app.options(/.*/, cors(corsOptions))
 app.use(express.json())
 
 class HttpError extends Error {
@@ -258,6 +271,17 @@ app.delete('/api/products/:id', async (request, response) => {
   }
 })
 
+app.get('/api/transactions', async (_request, response) => {
+  const result = await pool.query(
+    `SELECT st.id, st.product_id, p.name AS product_name, p.sku,
+            st.transaction_type, st.quantity, st.note, st.created_at
+     FROM stock_transactions st
+     JOIN products p ON p.id = st.product_id
+     ORDER BY st.created_at DESC, st.id DESC`,
+  )
+  response.json(result.rows)
+})
+
 app.get('/api/dashboard', async (_request, response) => {
   const [totals, transactions] = await Promise.all([
     pool.query(
@@ -384,15 +408,24 @@ app.use((error, _request, response, _next) => {
   return response.status(500).json({ error: 'Internal server error' })
 })
 
-const server = app.listen(port, host, () => {
-  console.log(`API server listening on http://${host}:${port}`)
+export const handler = serverless(app, {
+  binary: [],
+  callbackWaitsForEmptyEventLoop: false,
 })
 
-async function shutdown() {
-  server.close(async () => {
-    await pool.end()
-  })
-}
+export default app
 
-process.on('SIGINT', shutdown)
-process.on('SIGTERM', shutdown)
+if (!isLambdaRuntime) {
+  const server = app.listen(port, host, () => {
+    console.log(`API server listening on http://${host}:${port}`)
+  })
+
+  async function shutdown() {
+    server.close(async () => {
+      await pool.end()
+    })
+  }
+
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
+}

@@ -4,6 +4,8 @@ dist/
 .env.*
 !.env.example
 server/.env
+server/.lambda-build/
+server/lambda-package.zip
 .aws/
 secrets/
 *.pem
